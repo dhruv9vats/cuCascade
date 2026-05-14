@@ -34,25 +34,37 @@ memory::memory_space* data_batch_core::get_memory_space() const
   return &(_data->get_memory_space());
 }
 
-[[nodiscard]] std::shared_ptr<data_batch> data_batch_core::clone(uint64_t new_batch_id,
-                                                                 rmm::cuda_stream_view stream) const
+void data_batch_core::set_data(std::unique_ptr<idata_representation> data)
 {
-  auto cloned_data = _data->clone(stream);
-  return data_batch::make(new_batch_id, std::move(cloned_data));
+  _data = std::move(data);
+  _probe->data_replaced(*_data);
 }
 
-data_batch_core::data_batch_core(uint64_t batch_id, std::unique_ptr<idata_representation> data)
-  : _batch_id(batch_id), _data(std::move(data))
+[[nodiscard]] std::shared_ptr<data_batch> data_batch_core::clone(
+  uint64_t new_batch_id,
+  rmm::cuda_stream_view stream,
+  std::shared_ptr<idata_batch_probe> probe) const
 {
+  auto cloned_data = _data->clone(stream);
+  return data_batch::make(new_batch_id, std::move(cloned_data), std::move(probe));
+}
+
+data_batch_core::data_batch_core(uint64_t batch_id,
+                                 std::unique_ptr<idata_representation> data,
+                                 std::shared_ptr<idata_batch_probe> probe)
+  : _batch_id(batch_id), _data(std::move(data)), _probe(std::move(probe))
+{
+  _probe->created(get_batch_id(), *get_data());
 }
 
 // ========== data_batch ==========
 
 std::shared_ptr<data_batch> data_batch::make(uint64_t batch_id,
-                                             std::unique_ptr<idata_representation> data)
+                                             std::unique_ptr<idata_representation> data,
+                                             std::shared_ptr<idata_batch_probe> probe)
 {
   if (data == nullptr) { throw std::runtime_error("data is null in data_batch constructor"); }
-  return std::shared_ptr<data_batch>(new data_batch(batch_id, std::move(data)));
+  return std::shared_ptr<data_batch>(new data_batch(batch_id, std::move(data), std::move(probe)));
 }
 
 read_only_data_batch data_batch::get_read_only()
@@ -85,7 +97,11 @@ std::optional<mutable_data_batch> data_batch::try_get_mutable()
   return mutable_data_batch(std::move(self), std::move(lock));
 }
 
-void data_batch::subscribe() { _subscriber_count.fetch_add(1, std::memory_order_relaxed); }
+void data_batch::subscribe()
+{
+  const size_t prev = _subscriber_count.fetch_add(1, std::memory_order_relaxed);
+  _probe->interest_changed(prev + 1, get_read_only_count());
+}
 
 void data_batch::unsubscribe()
 {
@@ -96,13 +112,16 @@ void data_batch::unsubscribe()
     }
     if (_subscriber_count.compare_exchange_weak(
           current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      _probe->interest_changed(current - 1, get_read_only_count());
       return;
     }
   }
 }
 
-data_batch::data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data)
-  : _batch(batch_id, std::move(data))
+data_batch::data_batch(uint64_t batch_id,
+                       std::unique_ptr<idata_representation> data,
+                       std::shared_ptr<idata_batch_probe> probe)
+  : _batch(batch_id, std::move(data), /*copy probe into core*/ probe), _probe(std::move(probe))
 {
 }
 
@@ -116,8 +135,12 @@ read_only_data_batch::~read_only_data_batch()
   // After this function returns, _lock destructor fires first (declared after _owner,
   // destroyed in reverse order), releasing the shared lock. Then _owner destructor fires.
   if (_owner) {  // the read_only_data_batch may have been moved.
-    size_t prev = _owner->_read_only_count.fetch_sub(1);
-    if (prev == 1) { _owner->_state.store(batch_state::idle); }
+    const size_t prev = _owner->_read_only_count.fetch_sub(1);
+    if (prev == 1) {
+      _owner->_state.store(batch_state::idle);
+      _owner->_probe->state_changed(batch_state::idle);
+    }
+    _owner->_probe->interest_changed(_owner->get_subscriber_count(), prev - 1);
   }
 }
 
@@ -132,11 +155,15 @@ read_only_data_batch& read_only_data_batch::operator=(read_only_data_batch&& oth
   if (this != &other) {
     // Release the current state (same logic as destructor)
     if (_owner) {
-      size_t prev = _owner->_read_only_count.fetch_sub(1);
-      if (prev == 1) { _owner->_state.store(batch_state::idle); }
+      const size_t prev = _owner->_read_only_count.fetch_sub(1);
+      if (prev == 1) {
+        _owner->_state.store(batch_state::idle);
+        _owner->_probe->state_changed(batch_state::idle);
+      }
+      _owner->_probe->interest_changed(_owner->get_subscriber_count(), prev - 1);
       // _lock will be replaced below; its destructor fires when the old _lock is overwritten,
       // releasing the shared lock. We release _lock explicitly here so the sequence is:
-      // decrement count -> set state (if last) -> release lock.
+      // decrement count -> set state (if last) -> release lock -> replace _owner.
       _lock.unlock();
     }
     _owner = std::move(other._owner);
@@ -150,8 +177,12 @@ read_only_data_batch::read_only_data_batch(std::shared_ptr<data_batch> owner,
                                            std::shared_lock<std::shared_mutex> lock)
   : _owner(std::move(owner)), _lock(std::move(lock))
 {
-  _owner->_read_only_count.fetch_add(1);
-  _owner->_state.store(batch_state::read_only);
+  const size_t prev = _owner->_read_only_count.fetch_add(1);
+  if (prev == 0) {
+    _owner->_state.store(batch_state::read_only);
+    _owner->_probe->state_changed(batch_state::read_only);
+  }
+  _owner->_probe->interest_changed(_owner->get_subscriber_count(), prev + 1);
 }
 
 // ========== mutable_data_batch ==========
@@ -161,6 +192,7 @@ mutable_data_batch::~mutable_data_batch()
   if (_owner) {  // mutable_data_batch may have been moved
     // Transition state to idle. The _lock member destructor handles releasing the exclusive lock.
     _owner->_state.store(batch_state::idle);
+    _owner->_probe->state_changed(batch_state::idle);
   }
 }
 
@@ -176,6 +208,7 @@ mutable_data_batch& mutable_data_batch::operator=(mutable_data_batch&& other) no
     // Release the current state (same logic as destructor)
     if (_owner) {
       _owner->_state.store(batch_state::idle);
+      _owner->_probe->state_changed(batch_state::idle);
       // Release the exclusive lock explicitly before taking ownership of the new one.
       _lock.unlock();
     }
@@ -191,6 +224,7 @@ mutable_data_batch::mutable_data_batch(std::shared_ptr<data_batch> owner,
   : _owner(std::move(owner)), _lock(std::move(lock))
 {
   _owner->_state.store(batch_state::mutable_locked);
+  _owner->_probe->state_changed(batch_state::mutable_locked);
 }
 
 }  // namespace cucascade

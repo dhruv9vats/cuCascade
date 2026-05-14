@@ -51,6 +51,7 @@ enum class batch_state { idle, read_only, mutable_locked };
 class read_only_data_batch;
 class mutable_data_batch;
 class data_batch;
+class idata_batch_probe;
 
 /**
  * @brief Internal data batch payload owned by data_batch.
@@ -111,7 +112,7 @@ class data_batch_core {
    * @brief Replace the data representation.
    * @param data New data representation (takes ownership).
    */
-  void set_data(std::unique_ptr<idata_representation> data) { _data = std::move(data); }
+  void set_data(std::unique_ptr<idata_representation> data);
 
   /**
    * @brief Convert the data representation in-place.
@@ -128,24 +129,7 @@ class data_batch_core {
   template <typename TargetRepresentation>
   void convert_to(representation_converter_registry& registry,
                   const memory::memory_space* target_memory_space,
-                  rmm::cuda_stream_view stream)
-  {
-    auto new_representation =
-      registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
-    auto old_representation = std::move(_data);
-    _data                   = std::move(new_representation);
-
-    bool needs_sync = (old_representation != nullptr &&
-                       old_representation->get_current_tier() == memory::Tier::GPU) ||
-                      _data->get_current_tier() == memory::Tier::GPU;
-
-    if (needs_sync) {
-      // Conversions involving GPU may enqueue async operations on the provided
-      // stream that read from the source memory. Synchronize before the old
-      // representation is destroyed to avoid use-after-free.
-      stream.synchronize();
-    }
-  }
+                  rmm::cuda_stream_view stream);
 
   /**
    * @brief Create an independent deep copy with representation conversion.
@@ -165,7 +149,8 @@ class data_batch_core {
     representation_converter_registry& registry,
     uint64_t new_batch_id,
     const memory::memory_space* target_memory_space,
-    rmm::cuda_stream_view stream) const;
+    rmm::cuda_stream_view stream,
+    std::shared_ptr<idata_batch_probe> probe = std::make_shared<idata_batch_probe>()) const;
 
   /**
    * @brief Create an independent deep copy of the batch data.
@@ -178,14 +163,19 @@ class data_batch_core {
    * @return A new data_batch wrapped in shared_ptr.
    * @throws std::runtime_error if the data is null.
    */
-  [[nodiscard]] std::shared_ptr<data_batch> clone(uint64_t new_batch_id,
-                                                  rmm::cuda_stream_view stream) const;
+  [[nodiscard]] std::shared_ptr<data_batch> clone(
+    uint64_t new_batch_id,
+    rmm::cuda_stream_view stream,
+    std::shared_ptr<idata_batch_probe> probe = std::make_shared<idata_batch_probe>()) const;
 
  private:
-  data_batch_core(uint64_t batch_id, std::unique_ptr<idata_representation> data);
+  data_batch_core(uint64_t batch_id,
+                  std::unique_ptr<idata_representation> data,
+                  std::shared_ptr<idata_batch_probe> probe);
 
   const uint64_t _batch_id;                     ///< Immutable batch identifier
   std::unique_ptr<idata_representation> _data;  ///< Owned data representation
+  std::shared_ptr<idata_batch_probe> _probe;
 };
 
 /**
@@ -200,8 +190,10 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   /**
    * @brief Factory function to create new data_batches.
    */
-  static std::shared_ptr<data_batch> make(uint64_t batch_id,
-                                          std::unique_ptr<idata_representation> data);
+  static std::shared_ptr<data_batch> make(
+    uint64_t batch_id,
+    std::unique_ptr<idata_representation> data,
+    std::shared_ptr<idata_batch_probe> probe = std::make_shared<idata_batch_probe>());
 
   /**
    * @brief Get the unique batch identifier.
@@ -294,7 +286,9 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   size_t get_read_only_count() const { return _read_only_count.load(std::memory_order_acquire); }
 
  private:
-  data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data);
+  data_batch(uint64_t batch_id,
+             std::unique_ptr<idata_representation> data,
+             std::shared_ptr<idata_batch_probe> probe);
 
   data_batch_core _batch;
   mutable std::shared_mutex _rw_mutex;
@@ -302,20 +296,8 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   std::atomic<size_t> _subscriber_count{0};            ///< Atomic subscriber interest count
   std::atomic<batch_state> _state{batch_state::idle};  ///< Observable lock state
   std::atomic<size_t> _read_only_count{0};  ///< Count of active read_only_data_batch instances
+  std::shared_ptr<idata_batch_probe> _probe;
 };
-
-// Defined after data_batch's concrete definition to use data_batch::make
-template <typename TargetRepresentation>
-[[nodiscard]] std::shared_ptr<data_batch> data_batch_core::clone_to(
-  representation_converter_registry& registry,
-  uint64_t new_batch_id,
-  const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream) const
-{
-  auto new_representation =
-    registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
-  return data_batch::make(new_batch_id, std::move(new_representation));
-}
 
 /**
  * @brief RAII read-only accessor for data_batch.
@@ -427,5 +409,97 @@ class mutable_data_batch {
   std::shared_ptr<data_batch> _owner;         ///< Parent lifetime (destroyed second)
   std::unique_lock<std::shared_mutex> _lock;  ///< Exclusive lock (destroyed first)
 };
+
+/**
+ * @brief Interface for probing the data_batch class.
+ *
+ * Applications may implement this interface to hold additional application specific
+ * data_batch metadata while probing the data_batch by overriding the provided methods
+ * that expose the data_batch state when certain events occur, like state transitions.
+ *
+ * @note It is the implementer's responsibility that the calls to this class' functions
+ * return quickly, as they are called in a thread-safe manner, and will block other
+ * mutating changes while they execute. This interface is primarily intended for
+ * bookkeeping purposes. Default impl is no-op
+ */
+class idata_batch_probe {
+ public:
+  idata_batch_probe()          = default;
+  virtual ~idata_batch_probe() = default;
+
+  virtual void created([[maybe_unused]] const uint64_t batch_id,
+                       [[maybe_unused]] const idata_representation& data)
+  {
+  }
+  virtual void conversion_started([[maybe_unused]] const idata_representation& current_data,
+                                  [[maybe_unused]] const memory::memory_space* target_memory_space)
+  {
+  }
+  virtual void conversion_completed([[maybe_unused]] const idata_representation& data,
+                                    [[maybe_unused]] const bool success)
+  {
+  }
+  virtual void data_replaced([[maybe_unused]] const idata_representation& new_data) {}
+  virtual void state_changed([[maybe_unused]] const batch_state new_state) {}
+  virtual void interest_changed([[maybe_unused]] const size_t& subscriber_count,
+                                [[maybe_unused]] const size_t& read_only_count)
+  {
+  }
+};
+
+// Defined after data_batch's concrete definition to use data_batch::make
+template <typename TargetRepresentation>
+[[nodiscard]] std::shared_ptr<data_batch> data_batch_core::clone_to(
+  representation_converter_registry& registry,
+  uint64_t new_batch_id,
+  const memory::memory_space* target_memory_space,
+  rmm::cuda_stream_view stream,
+  std::shared_ptr<idata_batch_probe> probe) const
+{
+  auto new_representation =
+    registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
+  return data_batch::make(new_batch_id, std::move(new_representation), std::move(probe));
+}
+
+// Defined after data_batch_probe's concrete definition to use data_batch_probe methods
+template <typename TargetRepresentation>
+void data_batch_core::convert_to(representation_converter_registry& registry,
+                                 const memory::memory_space* target_memory_space,
+                                 rmm::cuda_stream_view stream)
+{
+  _probe->conversion_started(*_data, target_memory_space);
+  bool conversion_succeeded = false;
+  // small helper that gets called when this scope is exited (including during exceptions)
+  struct OnScopeExit {
+    const std::shared_ptr<idata_batch_probe>& probe;
+    // a ref to the unique ptr so when data is updated,
+    // that new data is used in the notification.
+    const std::unique_ptr<idata_representation>& data;
+    const bool& success;
+
+    ~OnScopeExit() { probe->conversion_completed(*data, success); }
+  } on_scope_exit{
+    .probe   = _probe,
+    .data    = _data,
+    .success = conversion_succeeded,
+  };
+
+  auto new_representation =
+    registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
+  auto old_representation = std::move(_data);
+  _data                   = std::move(new_representation);
+
+  bool needs_sync = (old_representation != nullptr &&
+                     old_representation->get_current_tier() == memory::Tier::GPU) ||
+                    _data->get_current_tier() == memory::Tier::GPU;
+
+  if (needs_sync) {
+    // Conversions involving GPU may enqueue async operations on the provided
+    // stream that read from the source memory. Synchronize before the old
+    // representation is destroyed to avoid use-after-free.
+    stream.synchronize();
+  }
+  conversion_succeeded = true;  // ref used by on_scope_exit helper.
+}
 
 }  // namespace cucascade
